@@ -129,12 +129,12 @@ public func hmac_sha1(key : &std::vector<uchar>, message : &std::vector<uchar>) 
     var inner_data = std::vector<uchar>()
     for(var i = 0u; i < 64u; i++) inner_data.push(inner_key[i])
     for(var i = 0u; i < message.size(); i++) inner_data.push(message.get(i))
-    var inner_hash = sha1(inner_data)
+    var inner_hash = sha1(&inner_data)
 
     var outer_data = std::vector<uchar>()
     for(var i = 0u; i < 64u; i++) outer_data.push(outer_key[i])
     for(var i = 0u; i < inner_hash.size(); i++) outer_data.push(inner_hash.get(i))
-    return sha1(outer_data)
+    return sha1(&outer_data)
 }
 
 func dynamic_truncate(hash : &std::vector<uchar>) : u32 {
@@ -157,8 +157,8 @@ public func totp(secret_bytes : &std::vector<uchar>, time_step : i64) : std::str
     counter.push((time_step >> 8) as uchar)
     counter.push(time_step as uchar)
 
-    var hmac_result = hmac_sha1(secret_bytes, counter)
-    var value = dynamic_truncate(hmac_result)
+    var hmac_result = hmac_sha1(secret_bytes, &counter)
+    var value = dynamic_truncate(&hmac_result)
     var code_num = value % 1000000u32
 
     var result = std::string()
@@ -234,7 +234,7 @@ public func generate_totp_secret() : std::string {
     for(var i = 0u; i < 20u; i++) {
         bytes.push((rand() % 256) as uchar)
     }
-    return base32_encode(bytes)
+    return base32_encode(&bytes)
 }
 
 public func generate_totp_uri(issuer : &std::string_view, account_name : &std::string_view, secret : &std::string_view) : std::string {
@@ -263,8 +263,8 @@ public func validate_totp_code(secret_base32 : &std::string_view, code : &std::s
     steps[1] = time_step + 1i64
     steps[2] = if(time_step > 0i64) time_step - 1i64 else 0i64
     for(var i = 0; i < 3; i++) {
-        var expected = totp(secret_bytes, steps[i])
-        if(expected.to_view().equals(*code)) return true
+        var expected = totp(&secret_bytes, steps[i])
+        if(expected.to_view().equals(code)) return true
     }
     return false
 }
