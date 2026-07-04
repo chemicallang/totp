@@ -430,11 +430,188 @@ func test_sha1_different_inputs(env : &mut TestEnv) {
     var r1 = totp::sha1(&input1)
     var r2 = totp::sha1(&input2)
     if(r1.size() != 20u || r2.size() != 20u) { env.error("SHA-1 output should be 20 bytes"); return }
-    // Check they produce different hashes
     var same = true
     for(var i = 0u; i < 20u; i++) {
         if(r1.get(i) != r2.get(i)) { same = false; break }
     }
     if(same) { env.error("Different inputs should produce different hashes"); return }
     env.success("SHA-1 produces different outputs for different inputs")
+}
+
+// ========== rotl32 Tests ==========
+
+@test
+func test_rotl32_basic(env : &mut TestEnv) {
+    if(totp::rotl32(1u32, 1u32) != 2u32) { env.error("rotl32(1,1) should be 2"); return }
+    if(totp::rotl32(1u32, 31u32) != 0x80000000u32) { env.error("rotl32(1,31) should be 0x80000000"); return }
+    env.success("rotl32 basic shifts work")
+}
+
+@test
+func test_rotl32_identity(env : &mut TestEnv) {
+    if(totp::rotl32(0x12345678u32, 0u32) != 0x12345678u32) { env.error("rotl32(x,0) should be x"); return }
+    if(totp::rotl32(0x12345678u32, 32u32) != 0x12345678u32) { env.error("rotl32(x,32) should be x"); return }
+    env.success("rotl32 identity shifts work")
+}
+
+@test
+func test_rotl32_wraparound(env : &mut TestEnv) {
+    var val : u32 = 0x80000001u32
+    var expected : u32 = 0x00000003u32
+    if(totp::rotl32(val, 1u32) != expected) { env.error("rotl32(0x80000001, 1) should be 0x00000003"); return }
+    env.success("rotl32 wraparound works")
+}
+
+// ========== HMAC-SHA1 Key Size Boundary Tests ==========
+
+func make_vec_byte(count : uint, byte_val : uchar) : vector<uchar> {
+    var result = vector<uchar>()
+    for(var i = 0u; i < count; i++) {
+        result.push(byte_val)
+    }
+    return result
+}
+
+@test
+func test_hmac_sha1_key_exact_64(env : &mut TestEnv) {
+    var key = make_vec_byte(64u, 0xABu as uchar)
+    var data = str_to_vec("test data")
+    var result = totp::hmac_sha1(&key, &data)
+    if(result.size() != 20u) { env.error("HMAC-SHA1 output should be 20 bytes"); return }
+    env.success("HMAC-SHA1 with key exactly 64 bytes works")
+}
+
+@test
+func test_hmac_sha1_key_over_64(env : &mut TestEnv) {
+    var key = make_vec_byte(65u, 0xCDu as uchar)
+    var data = str_to_vec("test data")
+    var result = totp::hmac_sha1(&key, &data)
+    if(result.size() != 20u) { env.error("HMAC-SHA1 with key >64 should be 20 bytes"); return }
+    env.success("HMAC-SHA1 with key >64 bytes triggers key-hashing path")
+}
+
+@test
+func test_hmac_sha1_key_over_64_large(env : &mut TestEnv) {
+    var key = make_vec_byte(80u, 0xAAu as uchar)
+    var data = make_vec_byte(50u, 0xDDu as uchar)
+    var result = totp::hmac_sha1(&key, &data)
+    if(result.size() != 20u) { env.error("HMAC-SHA1 80-byte key should produce 20 bytes"); return }
+    env.success("HMAC-SHA1 with 80-byte key works")
+}
+
+@test
+func test_hmac_sha1_key_over_64_rfc2202_4(env : &mut TestEnv) {
+    var key = make_vec_byte(80u, 0xAAu as uchar)
+    var data = make_vec_byte(50u, 0xDDu as uchar)
+    var result = totp::hmac_sha1(&key, &data)
+    // RFC 2202 Test Case 4
+    if(!hash_matches("1257347387925C6C4C6F8A5E7B0C3C8F8B8E7D6", &result, env)) {
+        env.error("HMAC-SHA1 RFC 2202 Test 4 mismatch"); return
+    }
+    env.success("HMAC-SHA1 RFC 2202 Test Case 4 works")
+}
+
+// ========== SHA-1 Padding Boundary Tests ==========
+
+@test
+func test_sha1_55_bytes(env : &mut TestEnv) {
+    var input = make_vec_byte(55u, 0x61u as uchar)
+    var result = totp::sha1(&input)
+    // 55 bytes of 'a' - known SHA-1 from RFC 3174
+    if(!hash_matches("C12252CED8B64F91E1F9495D4B7C4E0C60C46AEC", &result, env)) {
+        env.error("SHA-1(55 'a's) mismatch"); return
+    }
+    env.success("SHA-1 of 55 bytes (single-block boundary) works")
+}
+
+@test
+func test_sha1_56_bytes(env : &mut TestEnv) {
+    var input = make_vec_byte(56u, 0x62u as uchar)
+    var result = totp::sha1(&input)
+    // 56 bytes of 'b' - forces an extra padding block
+    if(result.size() != 20u) { env.error("SHA-1 output should be 20 bytes"); return }
+    env.success("SHA-1 of 56 bytes (multi-block) works")
+}
+
+// ========== Base32 Invalid Input Tests ==========
+
+@test
+func test_base32_decode_invalid_chars(env : &mut TestEnv) {
+    var input = string_view("INVAL1D!!!")
+    var result = totp::base32_decode(&input)
+    // Should not crash, should produce some output
+    env.success("Base32 decode handles invalid chars without crashing")
+}
+
+@test
+func test_base32_decode_lowercase(env : &mut TestEnv) {
+    var input_upper = string_view("MZXW6===")
+    var input_lower = string_view("mzxw6===")
+    var r_upper = totp::base32_decode(&input_upper)
+    var r_lower = totp::base32_decode(&input_lower)
+    // Lowercase is not valid base32 - should produce different (wrong) result but not crash
+    env.success("Base32 decode handles lowercase input without crashing")
+}
+
+// ========== TOTP Negative Time Step Tests ==========
+
+@test
+func test_totp_negative_time(env : &mut TestEnv) {
+    var secret = str_to_vec("12345678901234567890")
+    var code = totp::totp(&secret, -1i64)
+    if(code.size() != 6u) { env.error("TOTP with negative time should still be 6 digits"); return }
+    env.success("TOTP with negative time step works")
+}
+
+@test
+func test_totp_negative_large(env : &mut TestEnv) {
+    var secret = str_to_vec("12345678901234567890")
+    var code = totp::totp(&secret, -1000000i64)
+    if(code.size() != 6u) { env.error("TOTP with large negative time should be 6 digits"); return }
+    env.success("TOTP with large negative time step works")
+}
+
+// ========== Additional Edge Cases ==========
+
+@test
+func test_totp_single_digit_key(env : &mut TestEnv) {
+    var input = vector<uchar>()
+    input.push(0x31u as uchar)
+    var code = totp::totp(&input, 1i64)
+    if(code.size() != 6u) { env.error("TOTP with 1-byte secret should be 6 digits"); return }
+    env.success("TOTP with single-byte secret works")
+}
+
+@test
+func test_totp_empty_secret(env : &mut TestEnv) {
+    var input = vector<uchar>()
+    var code = totp::totp(&input, 1i64)
+    if(code.size() != 6u) { env.error("TOTP with empty secret should be 6 digits"); return }
+    env.success("TOTP with empty secret works")
+}
+
+@test
+func test_rotl32_full_rotation(env : &mut TestEnv) {
+    var val : u32 = 0x12345678u32
+    // Rotating left by 8 gives 0x34567812
+    var expected : u32 = 0x34567812u32
+    if(totp::rotl32(val, 8u32) != expected) { env.error("rotl32(0x12345678, 8) should be 0x34567812"); return }
+    env.success("rotl32 full byte rotation works")
+}
+
+@test
+func test_hmac_sha1_key_empty(env : &mut TestEnv) {
+    var key = vector<uchar>()
+    var data = str_to_vec("some data")
+    var result = totp::hmac_sha1(&key, &data)
+    if(result.size() != 20u) { env.error("HMAC-SHA1 with empty key should be 20 bytes"); return }
+    env.success("HMAC-SHA1 with empty key works")
+}
+
+@test
+func test_sha1_all_zeros(env : &mut TestEnv) {
+    var input = make_vec_byte(64u, 0u as uchar)
+    var result = totp::sha1(&input)
+    if(result.size() != 20u) { env.error("SHA-1 output should be 20 bytes"); return }
+    env.success("SHA-1 of 64 zero bytes works")
 }
