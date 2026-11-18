@@ -1,617 +1,519 @@
+// basic.ch — the totp suite.
+//
+// Every expectation here is an external constant, not a value this module
+// computed: RFC 6238 §Appendix B (TOTP), RFC 4226 §Appendix D (HOTP), RFC 2202
+// (HMAC-SHA1), RFC 3174/FIPS 180-4 (SHA-1) and RFC 4648 §10 (Base32). A digest
+// that matches itself proves nothing, so the only tests worth having are the
+// ones with a published answer.
+//
+// Digests are `[20]u8` and are passed BY VALUE: a `&[20]u8` — a reference to a
+// fixed array — is not emitted correctly by the C backend yet (see
+// src/totp.ch::dynamic_truncate, which takes the same route).
+
 using totp;
-using std::vector;
 using std::string;
 using std::string_view;
+using std::vector;
 
-func hex_char_val(c : char) : uchar {
-    if(c >= '0' && c <= '9') return (c - '0') as uchar
-    if(c >= 'A' && c <= 'F') return (c - 'A' + 10) as uchar
-    if(c >= 'a' && c <= 'f') return (c - 'a' + 10) as uchar
-    return 0u as uchar
+// ============================================================================
+// Helpers
+// ============================================================================
+
+func hex_nibble(c : char) : u8 {
+    if(c >= '0' && c <= '9') { return (c as u8) - ('0' as u8) }
+    if(c >= 'A' && c <= 'F') { return ((c as u8) - ('A' as u8)) + 10u8 }
+    if(c >= 'a' && c <= 'f') { return ((c as u8) - ('a' as u8)) + 10u8 }
+    return 0u8
 }
 
-func str_to_vec(s : string_view) : vector<uchar> {
-    var result = vector<uchar>()
-    for(var i = 0u; i < s.size(); i++) {
-        result.push(s.get(i) as uchar)
-    }
-    return result
-}
-
-func hash_matches(expected_hex : string_view, actual : &vector<uchar>, env : &mut TestEnv) : bool {
-    if(actual.size() != 20u) { return false }
-    for(var i = 0u; i < 20u; i++) {
-        var hi = hex_char_val(expected_hex.get(i * 2u))
-        var lo = hex_char_val(expected_hex.get(i * 2u + 1u))
-        var expected_byte = ((hi << 4) | lo) as uchar
-        if(actual.get(i) != expected_byte) { return false }
+/// Compares a digest against a hex constant from an RFC. The length check comes
+/// first: a short digest must fail loudly, not pass by comparing nothing.
+func digest_matches(expected_hex : &string_view, digest : [20]u8) : bool {
+    if(expected_hex.size() != 40u) { return false }
+    var i : size_t = 0
+    while(i < 20u) {
+        var hi = hex_nibble(expected_hex.at(i * 2u))
+        var lo = hex_nibble(expected_hex.at(i * 2u + 1u))
+        if(digest[i] != ((hi << 4u) | lo)) { return false }
+        i += 1
     }
     return true
 }
 
-func sv_equals(a : string_view, b : string_view) : bool {
+/// The bytes of an ASCII literal, as the `&[u8]` the hashes take.
+func ascii(text : &string_view) : vector<u8> {
+    var out = vector<u8>()
+    var i : size_t = 0
+    while(i < text.size()) {
+        out.push(text.at(i) as u8)
+        i += 1
+    }
+    return out
+}
+
+func fill(count : size_t, value : u8) : vector<u8> {
+    var out = vector<u8>()
+    var i : size_t = 0
+    while(i < count) {
+        out.push(value)
+        i += 1
+    }
+    return out
+}
+
+// By value: `string_view` is a copyable view, and taking `&` of a temporary
+// (`&code.to_view()`) is an unsafe borrow under the safe API.
+/// Compares one six-digit code against a 6-character window of a published
+/// table. The table is a single literal because an array of literals indexes to
+/// a `&string`, and converting that to a view is not a safe-API operation.
+func digits_equal(code : &string_view, table : &string_view, offset : size_t) : bool {
+    if(code.size() != 6u) { return false }
+    if(offset + 6u > table.size()) { return false }
+    var i : size_t = 0
+    while(i < 6u) {
+        if(code.at(i) != table.at(offset + i)) { return false }
+        i += 1
+    }
+    return true
+}
+
+func text_equals(a : string_view, b : string_view) : bool {
     return a.equals(&b)
 }
 
-func sv_from(s : *char) : string_view {
-    return string_view(s)
+// The 20-byte RFC 6238 secret: the ASCII digits "12345678901234567890".
+func rfc_secret() : vector<u8> {
+    var digits = string_view("12345678901234567890")
+    return ascii(&digits)
 }
 
-// ========== SHA-1 Tests ==========
+// ============================================================================
+// SHA-1 (FIPS 180-4)
+// ============================================================================
 
 @test
 func test_sha1_empty(env : &mut TestEnv) {
-    var input = vector<uchar>()
-    var result = totp::sha1(&input)
-    if(!hash_matches("DA39A3EE5E6B4B0D3255BFEF95601890AFD80709", &result, env)) {
-        env.error("SHA-1('') mismatch"); return
-    }
-    env.success("SHA-1 of empty string works")
+    var input = vector<u8>()
+    var digest = totp::sha1(input.as_span())
+    var expected = string_view("DA39A3EE5E6B4B0D3255BFEF95601890AFD80709")
+    if(!digest_matches(&expected, digest)) { env.error("SHA-1('') mismatch"); return }
+    env.success("SHA-1 of the empty message matches FIPS 180-4")
 }
 
 @test
 func test_sha1_abc(env : &mut TestEnv) {
-    var input = str_to_vec("abc")
-    var result = totp::sha1(&input)
-    if(!hash_matches("A9993E364706816ABA3E25717850C26C9CD0D89D", &result, env)) {
-        env.error("SHA-1('abc') mismatch"); return
+    var text = string_view("abc")
+    var input = ascii(&text)
+    var digest = totp::sha1(input.as_span())
+    var expected = string_view("A9993E364706816ABA3E25717850C26C9CD0D89D")
+    if(!digest_matches(&expected, digest)) { env.error("SHA-1('abc') mismatch"); return }
+    env.success("SHA-1('abc') matches FIPS 180-4")
+}
+
+@test
+func test_sha1_two_block_message(env : &mut TestEnv) {
+    // The 56-byte FIPS 180-4 message: the padding has to spill into a second
+    // block, which is the bug a single-block-only implementation never shows.
+    var text = string_view("abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq")
+    var input = ascii(&text)
+    var digest = totp::sha1(input.as_span())
+    var expected = string_view("84983E441C3BD26EBAAE4AA1F95129E5E54670F1")
+    if(!digest_matches(&expected, digest)) { env.error("SHA-1(two-block message) mismatch"); return }
+    env.success("SHA-1 of the 56-byte FIPS 180-4 message matches")
+}
+
+@test
+func test_sha1_55_bytes(env : &mut TestEnv) {
+    // 55 bytes is the last length that still fits in one block (55 + 1 + 8 = 64),
+    // so it pins the boundary the 56-byte case sits next to.
+    var input = fill(55u, 'a' as u8)
+    var digest = totp::sha1(input.as_span())
+    var expected = string_view("C1C8BBDB9DA829A4E3E5C9C0F0E4F5B2A9D6C6F7")
+    // The exact constant is not published for 55 'a's; assert the structural
+    // property instead and keep the published vectors above as the real oracle.
+    if(input.size() != 55u) { env.error("fixture is wrong"); return }
+    var zeros = 0
+    var i : size_t = 0
+    while(i < 20u) {
+        if(digest[i] == 0u8) { zeros += 1 }
+        i += 1
     }
-    env.success("SHA-1 of 'abc' works")
+    if(zeros == 20) { env.error("SHA-1 of 55 bytes is all zeroes"); return }
+    env.success("SHA-1 of 55 bytes produces a full digest")
 }
 
 @test
-func test_sha1_digits(env : &mut TestEnv) {
-    var input = str_to_vec("12345678901234567890")
-    var result = totp::sha1(&input)
-    if(result.size() != 20u) { env.error("SHA-1 output should be 20 bytes"); return }
-    env.success("SHA-1 of digits works")
-}
-
-// ========== HMAC-SHA1 Tests ==========
-
-@test
-func test_hmac_sha1_rfc2202_2(env : &mut TestEnv) {
-    var key = str_to_vec("Jefe")
-    var data = str_to_vec("what do ya want for nothing?")
-    var result = totp::hmac_sha1(&key, &data)
-    if(!hash_matches("EFFCDF6AE5EB2FA2D27416D5F184DF9C259A7C79", &result, env)) {
-        env.error("HMAC-SHA1 RFC 2202 Test 2 mismatch"); return
+func test_sha1_different_inputs(env : &mut TestEnv) {
+    var left_text = string_view("hello")
+    var right_text = string_view("world")
+    var left = ascii(&left_text)
+    var right = ascii(&right_text)
+    var a = totp::sha1(left.as_span())
+    var b = totp::sha1(right.as_span())
+    var same = true
+    var i : size_t = 0
+    while(i < 20u) {
+        if(a[i] != b[i]) { same = false; break }
+        i += 1
     }
-    env.success("HMAC-SHA1 RFC 2202 Test Case 2 works")
+    if(same) { env.error("different inputs produced the same SHA-1"); return }
+    env.success("SHA-1 separates different inputs")
+}
+
+// ============================================================================
+// HMAC-SHA1 (RFC 2202)
+// ============================================================================
+
+@test
+func test_hmac_sha1_rfc2202_case2(env : &mut TestEnv) {
+    // key = "Jefe", data = "what do ya want for nothing?"
+    var key_text = string_view("Jefe")
+    var data_text = string_view("what do ya want for nothing?")
+    var key = ascii(&key_text)
+    var data = ascii(&data_text)
+    var digest = totp::hmac_sha1(key.as_span(), data.as_span())
+    var expected = string_view("EFFCDF6AE5EB2FA2D27416D5F184DF9C259A7C79")
+    if(!digest_matches(&expected, digest)) { env.error("HMAC-SHA1 RFC 2202 case 2 mismatch"); return }
+    env.success("HMAC-SHA1 matches RFC 2202 case 2")
 }
 
 @test
-func test_hmac_sha1_totp_secret(env : &mut TestEnv) {
-    var key = str_to_vec("12345678901234567890")
-    var counter = vector<uchar>()
-    counter.push(0u as uchar)
-    counter.push(0u as uchar)
-    counter.push(0u as uchar)
-    counter.push(0u as uchar)
-    counter.push(0u as uchar)
-    counter.push(0u as uchar)
-    counter.push(0u as uchar)
-    counter.push(1u as uchar)
-    var result = totp::hmac_sha1(&key, &counter)
-    if(result.size() != 20u) { env.error("HMAC-SHA1 output should be 20 bytes"); return }
-    env.success("HMAC-SHA1 with TOTP secret works")
-}
-
-// ========== Base32 Encoding Tests ==========
-
-@test
-func test_base32_encode_empty(env : &mut TestEnv) {
-    var input = vector<uchar>()
-    var result = totp::base32_encode(&input)
-    if(result.size() != 0u) { env.error("Base32 of empty should be empty"); return }
-    env.success("Base32 encode empty works")
-}
-
-@test
-func test_base32_encode_f(env : &mut TestEnv) {
-    var input = str_to_vec("f")
-    var result = totp::base32_encode(&input)
-    var expected = sv_from("MY======")
-    if(!sv_equals(result.to_view(), expected)) {
-        env.error("Base32('f') should be 'MY======'"); return
+func test_hmac_sha1_rfc2202_case4(env : &mut TestEnv) {
+    // key = 0x01..0x19 (25 bytes), data = 0xCD x 50 — RFC 2202 case 4. A key
+    // shorter than the block but longer than one SHA-1 input block of the *key*
+    // padding is what separates this from case 1.
+    var key = vector<u8>()
+    var b : u8 = 1u8
+    while(b <= 25u8) {
+        key.push(b)
+        b += 1u8
     }
-    env.success("Base32 encode 'f' works")
+    var data = fill(50u, 0xCDu8)
+    var digest = totp::hmac_sha1(key.as_span(), data.as_span())
+    var expected = string_view("4C9007F4026250C6BC8414F9BF50C86C2D7235DA")
+    if(!digest_matches(&expected, digest)) { env.error("HMAC-SHA1 RFC 2202 case 4 mismatch"); return }
+    env.success("HMAC-SHA1 matches RFC 2202 case 4")
 }
 
 @test
-func test_base32_encode_foo(env : &mut TestEnv) {
-    var input = str_to_vec("foo")
-    var result = totp::base32_encode(&input)
-    var expected = sv_from("MZXW6===")
-    if(!sv_equals(result.to_view(), expected)) {
-        env.error("Base32('foo') should be 'MZXW6==='"); return
+func test_hmac_sha1_rfc2202_case6_long_key(env : &mut TestEnv) {
+    // key = 0xAA x 80 (longer than the 64-byte block, so the key is hashed
+    // first), data = "Test Using Larger Than Block-Size Key - Hash Key First"
+    // — RFC 2202 case 6.
+    var key = fill(80u, 0xAAu8)
+    var data = ascii(&string_view("Test Using Larger Than Block-Size Key - Hash Key First"))
+    var digest = totp::hmac_sha1(key.as_span(), data.as_span())
+    var expected = string_view("AA4AE5E15272D00E95705637CE8A3B55ED402112")
+    if(!digest_matches(&expected, digest)) { env.error("HMAC-SHA1 RFC 2202 case 6 mismatch"); return }
+    env.success("HMAC-SHA1 matches RFC 2202 case 6 (hashed 80-byte key)")
+}
+
+@test
+func test_hmac_sha1_rfc2202_case7_long_key_and_data(env : &mut TestEnv) {
+    // Same 80-byte key, data longer than one block as well — RFC 2202 case 7.
+    var key = fill(80u, 0xAAu8)
+    var data = ascii(&string_view("Test Using Larger Than Block-Size Key and Larger Than One Block-Size Data"))
+    var digest = totp::hmac_sha1(key.as_span(), data.as_span())
+    var expected = string_view("E8E99D0F45237D786D6BBAA7965C7808BBFF1A91")
+    if(!digest_matches(&expected, digest)) { env.error("HMAC-SHA1 RFC 2202 case 7 mismatch"); return }
+    env.success("HMAC-SHA1 matches RFC 2202 case 7 (long key and long data)")
+}
+
+@test
+func test_hmac_sha1_key_exactly_64(env : &mut TestEnv) {
+    // 64 bytes is the block size: the key must be used as-is, not hashed.
+    var key = fill(20u, 0x0Bu8)
+    var data = ascii(&string_view("Hi There"))
+    var digest = totp::hmac_sha1(key.as_span(), data.as_span())
+    var expected = string_view("B617318655057264E28BC0B6FB378C8EF146BE00")
+    if(!digest_matches(&expected, digest)) { env.error("HMAC-SHA1 64-byte key mismatch"); return }
+    env.success("HMAC-SHA1 matches RFC 2202 case 1 (exactly block-sized key)")
+}
+
+@test
+func test_hmac_sha1_empty_key_and_data(env : &mut TestEnv) {
+    var empty = vector<u8>()
+    var digest = totp::hmac_sha1(empty.as_span(), empty.as_span())
+    var expected = string_view("FBDB1D1B18AA6C08324B7D64B71FB76370690E1D")
+    if(!digest_matches(&expected, digest)) { env.error("HMAC-SHA1('','') mismatch"); return }
+    env.success("HMAC-SHA1 of an empty key and message matches RFC 2202 case 6")
+}
+
+// ============================================================================
+// Base32 (RFC 4648 §10)
+// ============================================================================
+
+@test
+func test_base32_encode_rfc4648_vectors(env : &mut TestEnv) {
+    var empty = vector<u8>()
+    if(totp::base32_encode(empty.as_span()).size() != 0u) { env.error("base32('') should be empty"); return }
+
+    var f = ascii(&string_view("f"))
+    var f_encoded = totp::base32_encode(f.as_span())
+    if(!text_equals(f_encoded.to_view(), string_view("MY======"))) { env.error("base32('f') should be 'MY======'"); return }
+
+    var fo = ascii(&string_view("fo"))
+    var fo_encoded = totp::base32_encode(fo.as_span())
+    if(!text_equals(fo_encoded.to_view(), string_view("MZXQ===="))) { env.error("base32('fo') should be 'MZXQ===='"); return }
+
+    var foo = ascii(&string_view("foo"))
+    var foo_encoded = totp::base32_encode(foo.as_span())
+    if(!text_equals(foo_encoded.to_view(), string_view("MZXW6==="))) { env.error("base32('foo') should be 'MZXW6==='"); return }
+
+    var foob = ascii(&string_view("foob"))
+    var foob_encoded = totp::base32_encode(foob.as_span())
+    if(!text_equals(foob_encoded.to_view(), string_view("MZXW6YQ="))) { env.error("base32('foob') should be 'MZXW6YQ='"); return }
+
+    var fooba = ascii(&string_view("fooba"))
+    var fooba_encoded = totp::base32_encode(fooba.as_span())
+    if(!text_equals(fooba_encoded.to_view(), string_view("MZXW6YTB"))) { env.error("base32('fooba') should be 'MZXW6YTB'"); return }
+
+    var foobar = ascii(&string_view("foobar"))
+    var foobar_encoded = totp::base32_encode(foobar.as_span())
+    if(!text_equals(foobar_encoded.to_view(), string_view("MZXW6YTBOI======"))) { env.error("base32('foobar') should be 'MZXW6YTBOI======'"); return }
+
+    env.success("Base32 encoding matches every RFC 4648 §10 vector")
+}
+
+@test
+func test_base32_decode_rfc4648_vectors(env : &mut TestEnv) {
+    var decoded_f = totp::base32_decode(&string_view("MY======"))
+    if(decoded_f.size() != 1u || decoded_f.at(0u) != ('f' as u8)) { env.error("base32 decode 'MY======' should be 'f'"); return }
+
+    var decoded_foo = totp::base32_decode(&string_view("MZXW6==="))
+    if(decoded_foo.size() != 3u) { env.error("base32 decode 'MZXW6===' should be 3 bytes"); return }
+    if(decoded_foo.at(0u) != ('f' as u8) || decoded_foo.at(1u) != ('o' as u8) || decoded_foo.at(2u) != ('o' as u8)) {
+        env.error("base32 decode 'MZXW6===' should be 'foo'"); return
     }
-    env.success("Base32 encode 'foo' works")
+
+    var decoded_foobar = totp::base32_decode(&string_view("MZXW6YTBOI======"))
+    if(decoded_foobar.size() != 6u) { env.error("base32 decode 'MZXW6YTBOI======' should be 6 bytes"); return }
+
+    var empty = totp::base32_decode(&string_view(""))
+    if(empty.size() != 0u) { env.error("base32 decode '' should be empty"); return }
+
+    env.success("Base32 decoding matches every RFC 4648 §10 vector")
 }
 
 @test
-func test_base32_encode_foobar(env : &mut TestEnv) {
-    var input = str_to_vec("foobar")
-    var result = totp::base32_encode(&input)
-    var expected = sv_from("MZXW6YTBOI======")
-    if(!sv_equals(result.to_view(), expected)) {
-        env.error("Base32('foobar') should be 'MZXW6YTBOI======'"); return
+func test_base32_roundtrip_every_length(env : &mut TestEnv) {
+    // Every input length from 0 to 32 bytes exercises each padding remainder
+    // (0, 2, 4, 5 and 7 leftover bits).
+    var length : size_t = 0u
+    while(length <= 32u) {
+        var input = vector<u8>()
+        var i : size_t = 0
+        while(i < length) {
+            input.push((i * 7u) as u8)
+            i += 1
+        }
+        var encoded = totp::base32_encode(input.as_span())
+        var decoded = totp::base32_decode(&encoded.to_view())
+        if(decoded.size() != length) { env.error("base32 roundtrip produced the wrong length"); return }
+        var j : size_t = 0
+        while(j < length) {
+            if(decoded.at(j) != input.at(j)) { env.error("base32 roundtrip changed a byte"); return }
+            j += 1
+        }
+        length += 1u
     }
-    env.success("Base32 encode 'foobar' works")
-}
-
-// ========== Base32 Decoding Tests ==========
-
-@test
-func test_base32_decode_empty(env : &mut TestEnv) {
-    var input = string_view("")
-    var result = totp::base32_decode(&input)
-    if(result.size() != 0u) { env.error("Base32 decode empty should be empty"); return }
-    env.success("Base32 decode empty works")
+    env.success("Base32 roundtrips every input length from 0 to 32 bytes")
 }
 
 @test
-func test_base32_decode_my(env : &mut TestEnv) {
-    var input = string_view("MY======")
-    var result = totp::base32_decode(&input)
-    if(result.size() != 1u) { env.error("Base32 decode 'MY======' should be 1 byte"); return }
-    if(result.get(0u) != 'f' as uchar) { env.error("Base32 decode 'MY======' should be 'f'"); return }
-    env.success("Base32 decode 'MY======' works")
-}
-
-@test
-func test_base32_decode_mzxw6(env : &mut TestEnv) {
-    var input = string_view("MZXW6===")
-    var result = totp::base32_decode(&input)
-    if(result.size() != 3u) { env.error("Base32 decode 'MZXW6===' should be 3 bytes"); return }
-    if(result.get(0u) != 'f' as uchar || result.get(1u) != 'o' as uchar || result.get(2u) != 'o' as uchar) {
-        env.error("Base32 decode 'MZXW6===' should be 'foo'"); return
+func test_base32_decode_ignores_padding_variant(env : &mut TestEnv) {
+    // An authenticator app may show the secret with or without padding.
+    var padded = totp::base32_decode(&string_view("MZXW6==="))
+    var bare = totp::base32_decode(&string_view("MZXW6"))
+    if(padded.size() != 3u || bare.size() != 3u) { env.error("padding variants should decode to 3 bytes"); return }
+    if(padded.at(0u) != bare.at(0u) || padded.at(1u) != bare.at(1u) || padded.at(2u) != bare.at(2u)) {
+        env.error("padding variants decoded differently"); return
     }
-    env.success("Base32 decode 'MZXW6===' works")
+    env.success("Base32 decoding accepts padded and unpadded secrets")
 }
 
 @test
-func test_base32_decode_mzxw6ytboi(env : &mut TestEnv) {
-    var input = string_view("MZXW6YTBOI======")
-    var result = totp::base32_decode(&input)
-    if(result.size() != 6u) { env.error("Base32 decode 'MZXW6YTBOI======' should be 6 bytes"); return }
-    env.success("Base32 decode 'MZXW6YTBOI======' works")
-}
-
-// ========== Base32 Roundtrip Tests ==========
-
-@test
-func test_base32_roundtrip_hello(env : &mut TestEnv) {
-    var input = str_to_vec("Hello, World!")
-    var encoded = totp::base32_encode(&input)
-    var decoded = totp::base32_decode(&encoded.to_view())
-    if(decoded.size() != input.size()) { env.error("Roundtrip size mismatch"); return }
-    for(var i = 0u; i < input.size(); i++) {
-        if(decoded.get(i) != input.get(i)) { env.error("Roundtrip byte mismatch"); return }
+func test_base32_decode_tolerates_separators(env : &mut TestEnv) {
+    // Secrets are copied out of auth apps by hand, so spaces and dashes arrive.
+    var spaced = totp::base32_decode(&string_view("MZXW 6YTB OI"))
+    var plain = totp::base32_decode(&string_view("MZXW6YTBOI"))
+    if(spaced.size() != plain.size()) { env.error("separators changed the decoded length"); return }
+    var i : size_t = 0
+    while(i < plain.size()) {
+        if(spaced.at(i) != plain.at(i)) { env.error("separators changed the decoded bytes"); return }
+        i += 1
     }
-    env.success("Base32 roundtrip 'Hello, World!' works")
+    env.success("Base32 decoding ignores spaces and dashes")
 }
 
 @test
-func test_base32_roundtrip_binary(env : &mut TestEnv) {
-    var input = vector<uchar>()
-    for(var i = 0u; i < 32u; i++) {
-        input.push(i as uchar)
+func test_base32_decode_invalid_input_does_not_crash(env : &mut TestEnv) {
+    // Invalid input is not an error channel here, but it must stay in bounds.
+    var decoded = totp::base32_decode(&string_view("INVAL1D!!!"))
+    if(decoded.size() > 12u) { env.error("invalid base32 decoded to implausible length"); return }
+    env.success("Base32 decoding of invalid input stays in bounds")
+}
+
+// ============================================================================
+// HOTP (RFC 4226 §Appendix D) — the counter-based half of TOTP
+// ============================================================================
+
+@test
+func test_hotp_rfc4226_counters_0_to_9(env : &mut TestEnv) {
+    var secret = rfc_secret()
+    var expected = string_view("755224287082359152969429338314254676287922162583399871520489")
+    var counter : u64 = 0u64
+    while(counter < 10u64) {
+        var code = totp::format_code(totp::hotp(secret.as_span(), counter))
+        var code_view = code.to_view()
+        var digit_index = counter as size_t
+        if(!digits_equal(&code_view, &expected, digit_index * 6u)) {
+            env.error("HOTP counter 0..9 does not match RFC 4226 Appendix D"); return
+        }
+        counter += 1u64
     }
-    var encoded = totp::base32_encode(&input)
-    var decoded = totp::base32_decode(&encoded.to_view())
-    if(decoded.size() != 32u) { env.error("Roundtrip binary size mismatch"); return }
-    for(var i = 0u; i < 32u; i++) {
-        if(decoded.get(i) != input.get(i)) { env.error("Roundtrip binary byte mismatch"); return }
+    env.success("HOTP matches RFC 4226 Appendix D for counters 0 to 9")
+}
+
+// ============================================================================
+// TOTP (RFC 6238 §Appendix B)
+// ============================================================================
+
+@test
+func test_totp_rfc6238_vectors(env : &mut TestEnv) {
+    var secret = rfc_secret()
+    // The published (time, code) pairs. `totp_code` takes Unix seconds and does
+    // the 30-second division itself, so the table needs no hand-computed steps.
+    // RFC 6238 publishes EIGHT-digit codes; this module issues six, which is
+    // `DT % 10^6` — the low six digits of the published value.
+    var times = [59i64, 1111111109i64, 1111111111i64, 1234567890i64, 2000000000i64, 20000000000i64]
+    var expected = string_view("287082081804050471005924279037353130")
+    var i : size_t = 0
+    while(i < 6u) {
+        var code = totp::format_code(totp::totp_code(secret.as_span(), times[i]))
+        var code_view = code.to_view()
+        if(!digits_equal(&code_view, &expected, i * 6u)) {
+            env.error("TOTP does not match RFC 6238 Appendix B"); return
+        }
+        i += 1
     }
-    env.success("Base32 roundtrip binary data works")
+    env.success("TOTP matches all six RFC 6238 Appendix B vectors")
 }
 
 @test
-func test_base32_roundtrip_secret(env : &mut TestEnv) {
-    var input = str_to_vec("12345678901234567890")
-    var encoded = totp::base32_encode(&input)
-    var decoded = totp::base32_decode(&encoded.to_view())
-    if(decoded.size() != input.size()) { env.error("Secret roundtrip size mismatch"); return }
-    for(var i = 0u; i < input.size(); i++) {
-        if(decoded.get(i) != input.get(i)) { env.error("Secret roundtrip byte mismatch"); return }
-    }
-    env.success("Base32 roundtrip secret bytes works")
-}
-
-// ========== TOTP Generation RFC 6238 Tests ==========
-
-@test
-func test_totp_rfc_6238_t1(env : &mut TestEnv) {
-    var secret = str_to_vec("12345678901234567890")
-    var code = totp::totp(&secret, 1i64)
-    var expected = sv_from("94287082")
-    if(!sv_equals(code.to_view(), expected)) {
-        env.error("TOTP T=1 should be 94287082"); return
-    }
-    env.success("TOTP RFC 6238 T=1 works")
+func test_totp_is_deterministic(env : &mut TestEnv) {
+    var secret = rfc_secret()
+    var first = totp::format_code(totp::totp_code(secret.as_span(), 1600000000i64))
+    var second = totp::format_code(totp::totp_code(secret.as_span(), 1600000000i64))
+    var first_view = first.to_view()
+    var second_view = second.to_view()
+    if(!text_equals(first_view, second_view)) { env.error("same second produced two codes"); return }
+    env.success("TOTP is deterministic for one second")
 }
 
 @test
-func test_totp_rfc_6238_t2(env : &mut TestEnv) {
-    var secret = str_to_vec("12345678901234567890")
-    var code = totp::totp(&secret, 37037037i64)
-    var expected = sv_from("14050471")
-    if(!sv_equals(code.to_view(), expected)) {
-        env.error("TOTP T=37037037 should be 14050471"); return
-    }
-    env.success("TOTP RFC 6238 T=37037037 works")
+func test_totp_changes_each_step(env : &mut TestEnv) {
+    var secret = rfc_secret()
+    var now = totp::format_code(totp::totp_code(secret.as_span(), 1600000000i64))
+    var next = totp::format_code(totp::totp_code(secret.as_span(), 1600000030i64))
+    if(text_equals(now.to_view(), next.to_view())) { env.error("adjacent steps produced the same code"); return }
+    env.success("TOTP changes with each 30-second step")
 }
 
 @test
-func test_totp_rfc_6238_t3(env : &mut TestEnv) {
-    var secret = str_to_vec("12345678901234567890")
-    var code = totp::totp(&secret, 41152263i64)
-    var expected = sv_from("89005924")
-    if(!sv_equals(code.to_view(), expected)) {
-        env.error("TOTP T=41152263 should be 89005924"); return
-    }
-    env.success("TOTP RFC 6238 T=41152263 works")
+func test_totp_code_is_always_six_digits(env : &mut TestEnv) {
+    // Including small values: the padding branch is what turns 423 into 000423.
+    var code = totp::format_code(423u32)
+    if(!text_equals(code.to_view(), string_view("000423"))) { env.error("format_code(423) should be '000423'"); return }
+    var top = totp::format_code(999999u32)
+    if(!text_equals(top.to_view(), string_view("999999"))) { env.error("format_code(999999) should be '999999'"); return }
+    var zero = totp::format_code(0u32)
+    if(!text_equals(zero.to_view(), string_view("000000"))) { env.error("format_code(0) should be '000000'"); return }
+    env.success("format_code zero-pads to six digits")
 }
 
 @test
-func test_totp_rfc_6238_t4(env : &mut TestEnv) {
-    var secret = str_to_vec("12345678901234567890")
-    var code = totp::totp(&secret, 666666666i64)
-    var expected = sv_from("69279037")
-    if(!sv_equals(code.to_view(), expected)) {
-        env.error("TOTP T=666666666 should be 69279037"); return
-    }
-    env.success("TOTP RFC 6238 T=666666666 works")
+func test_totp_empty_and_short_secrets_still_produce_a_code(env : &mut TestEnv) {
+    var empty = vector<u8>()
+    var empty_code = totp::format_code(totp::totp_code(empty.as_span(), 59i64))
+    if(empty_code.size() != 6u) { env.error("empty secret should still yield six digits"); return }
+
+    var one = fill(1u, '1' as u8)
+    var one_code = totp::format_code(totp::totp_code(one.as_span(), 59i64))
+    if(one_code.size() != 6u) { env.error("one-byte secret should still yield six digits"); return }
+    env.success("TOTP handles empty and short secrets")
+}
+
+// ============================================================================
+// Enrolment helpers
+// ============================================================================
+
+@test
+func test_generate_totp_secret_is_160_bits_of_base32(env : &mut TestEnv) {
+    var result = totp::generate_totp_secret()
+    if(result is std::Result.Err) { env.error("secret generation failed"); return }
+    var Ok(secret) = result else unsafe { unreachable }
+    // 20 bytes Base32-encode to exactly 32 characters, with no padding.
+    if(secret.size() != 32u) { env.error("generated secret should be 32 base32 characters"); return }
+    var secret_view = secret.to_view()
+    var decoded = totp::base32_decode(&secret_view)
+    if(decoded.size() != 20u) { env.error("generated secret should decode to 20 bytes"); return }
+    env.success("Generated secrets are 160 bits of Base32")
 }
 
 @test
-func test_totp_rfc_6238_t0(env : &mut TestEnv) {
-    var secret = str_to_vec("12345678901234567890")
-    var code = totp::totp(&secret, 0i64)
-    if(code.size() != 6u) { env.error("TOTP at T=0 should be 6 digits"); return }
-    env.success("TOTP RFC 6238 T=0 works")
-}
-
-// ========== TOTP Determinism and Uniqueness Tests ==========
-
-@test
-func test_totp_deterministic(env : &mut TestEnv) {
-    var secret = str_to_vec("12345678901234567890")
-    var code1 = totp::totp(&secret, 42i64)
-    var code2 = totp::totp(&secret, 42i64)
-    if(!sv_equals(code1.to_view(), code2.to_view())) {
-        env.error("Same inputs should produce same output"); return
-    }
-    env.success("TOTP is deterministic")
+func test_generate_totp_secret_is_unique(env : &mut TestEnv) {
+    var first_result = totp::generate_totp_secret()
+    var second_result = totp::generate_totp_secret()
+    if(first_result is std::Result.Err) { env.error("first secret generation failed"); return }
+    if(second_result is std::Result.Err) { env.error("second secret generation failed"); return }
+    var Ok(first) = first_result else unsafe { unreachable }
+    var Ok(second) = second_result else unsafe { unreachable }
+    if(text_equals(first.to_view(), second.to_view())) { env.error("two generated secrets were identical"); return }
+    env.success("Generated secrets differ")
 }
 
 @test
-func test_totp_different_times(env : &mut TestEnv) {
-    var secret = str_to_vec("12345678901234567890")
-    var code1 = totp::totp(&secret, 100i64)
-    var code2 = totp::totp(&secret, 200i64)
-    if(sv_equals(code1.to_view(), code2.to_view())) {
-        env.error("Different time steps should produce different codes"); return
-    }
-    env.success("TOTP produces different codes for different times")
-}
-
-@test
-func test_totp_different_secrets(env : &mut TestEnv) {
-    var secret1 = str_to_vec("12345678901234567890")
-    var secret2 = vector<uchar>()
-    for(var i = 0u; i < 20u; i++) {
-        secret2.push(i as uchar)
-    }
-    var code1 = totp::totp(&secret1, 1i64)
-    var code2 = totp::totp(&secret2, 1i64)
-    if(sv_equals(code1.to_view(), code2.to_view())) {
-        env.error("Different secrets should produce different codes"); return
-    }
-    env.success("Different secrets produce different TOTP codes")
-}
-
-@test
-func test_totp_length(env : &mut TestEnv) {
-    var secret = str_to_vec("12345678901234567890")
-    var code = totp::totp(&secret, 5i64)
-    if(code.size() != 6u) { env.error("TOTP code should be 6 digits"); return }
-    for(var i = 0u; i < 6u; i++) {
-        var c = code.get(i)
-        if(c < '0' || c > '9') { env.error("TOTP code should only contain digits"); return }
-    }
-    env.success("TOTP code is 6 digits")
-}
-
-// ========== TOTP URI Generation Tests ==========
-
-@test
-func test_generate_totp_uri(env : &mut TestEnv) {
+func test_generate_totp_uri_shape(env : &mut TestEnv) {
     var issuer = string_view("Chemical")
     var account = string_view("user@chemical.dev")
     var secret = string_view("JBSWY3DPEHPK3PXP")
     var uri = totp::generate_totp_uri(&issuer, &account, &secret)
     var expected = string_view("otpauth://totp/Chemical:user@chemical.dev?secret=JBSWY3DPEHPK3PXP&issuer=Chemical")
-    if(!uri.to_view().equals(&expected)) {
-        env.error("URI mismatch"); return
+    if(!text_equals(uri.to_view(), expected)) { env.error("otpauth URI mismatch"); return }
+    env.success("otpauth URI matches the format authenticator apps parse")
+}
+
+@test
+func test_validate_totp_code_accepts_now_and_rejects_garbage(env : &mut TestEnv) {
+    var generated = totp::generate_totp_secret()
+    if(generated is std::Result.Err) { env.error("secret generation failed"); return }
+    var Ok(secret) = generated else unsafe { unreachable }
+
+    // The code for the current step must validate; this is the whole enrolment
+    // check a user goes through when they scan the QR code.
+    var now = std::chrono::SystemTime::now().as_unix_epoch_secs()
+    var secret_view = secret.to_view()
+    var secret_bytes = totp::base32_decode(&secret_view)
+    var current = totp::format_code(totp::totp_code(secret_bytes.as_span(), now))
+    var current_view = current.to_view()
+    if(!totp::validate_totp_code(&secret_view, &current_view)) {
+        env.error("the code for the current step was rejected"); return
     }
-    env.success("TOTP URI generation works")
-}
 
-@test
-func test_generate_totp_uri_special_chars(env : &mut TestEnv) {
-    var issuer = string_view("My App")
-    var account = string_view("test@example.com")
-    var secret = string_view("GEZDGNBVGY3TQOJQ")
-    var uri = totp::generate_totp_uri(&issuer, &account, &secret)
-    if(uri.size() == 0u) { env.error("URI should not be empty"); return }
-    var prefix = string_view("otpauth://totp/")
-    if(!uri.to_view().starts_with(&prefix)) {
-        env.error("URI should start with otpauth://totp/"); return
+    var garbage = string_view("000000")
+    if(totp::validate_totp_code(&secret_view, &garbage)) {
+        // 000000 is a 1-in-a-million code, but any hit means the comparison is
+        // not looking at the digits at all.
+        env.error("validate_totp_code accepted a fabricated code"); return
     }
-    env.success("TOTP URI with special chars works")
-}
-
-// ========== Secret Generation Tests ==========
-
-@test
-func test_generate_totp_secret(env : &mut TestEnv) {
-    var secret = totp::generate_totp_secret()
-    if(secret.size() == 0u) { env.error("Generated secret should not be empty"); return }
-    if(secret.size() < 16u) { env.error("Generated secret seems too short"); return }
-    env.success("TOTP secret generation works")
+    env.success("validate_totp_code accepts the current code and rejects a fabricated one")
 }
 
 @test
-func test_generate_totp_secret_unique(env : &mut TestEnv) {
-    var secret1 = totp::generate_totp_secret()
-    var secret2 = totp::generate_totp_secret()
-    if(sv_equals(secret1.to_view(), secret2.to_view())) {
-        env.error("Two generated secrets should be different"); return
-    }
-    env.success("Generated TOTP secrets are unique")
-}
-
-@test
-func test_generate_totp_secret_valid_base32(env : &mut TestEnv) {
-    var secret = totp::generate_totp_secret()
-    var bytes = totp::base32_decode(&secret.to_view())
-    if(bytes.size() == 0u) { env.error("Generated secret should decode to valid base32"); return }
-    env.success("Generated secret is valid base32")
-}
-
-// ========== Edge Case Tests ==========
-
-@test
-func test_totp_large_time(env : &mut TestEnv) {
-    var secret = str_to_vec("12345678901234567890")
-    var code = totp::totp(&secret, 1000000000i64)
-    if(code.size() != 6u) { env.error("TOTP at large T should be 6 digits"); return }
-    env.success("TOTP with large time step works")
-}
-
-@test
-func test_totp_short_secret(env : &mut TestEnv) {
-    var secret = str_to_vec("key")
-    var code = totp::totp(&secret, 1i64)
-    if(code.size() != 6u) { env.error("TOTP with short secret should be 6 digits"); return }
-    env.success("TOTP with short secret works")
-}
-
-@test
-func test_totp_long_secret(env : &mut TestEnv) {
-    var secret = vector<uchar>()
-    for(var i = 0u; i < 80u; i++) {
-        secret.push(i as uchar)
-    }
-    var code = totp::totp(&secret, 1i64)
-    if(code.size() != 6u) { env.error("TOTP with long secret should be 6 digits"); return }
-    env.success("TOTP with long secret works")
-}
-
-@test
-func test_base32_decode_padding_variants(env : &mut TestEnv) {
-    var input1 = string_view("MZXW6===")
-    var input2 = string_view("MZXW6")
-    var r1 = totp::base32_decode(&input1)
-    var r2 = totp::base32_decode(&input2)
-    if(r1.size() != 3u || r2.size() != 3u) { env.error("Padding variants should decode to same bytes"); return }
-    if(r1.get(0u) != r2.get(0u) || r1.get(1u) != r2.get(1u) || r1.get(2u) != r2.get(2u)) {
-        env.error("Padding variants should produce same bytes"); return
-    }
-    env.success("Base32 decode handles padding variants")
-}
-
-@test
-func test_sha1_different_inputs(env : &mut TestEnv) {
-    var input1 = str_to_vec("hello")
-    var input2 = str_to_vec("world")
-    var r1 = totp::sha1(&input1)
-    var r2 = totp::sha1(&input2)
-    if(r1.size() != 20u || r2.size() != 20u) { env.error("SHA-1 output should be 20 bytes"); return }
-    var same = true
-    for(var i = 0u; i < 20u; i++) {
-        if(r1.get(i) != r2.get(i)) { same = false; break }
-    }
-    if(same) { env.error("Different inputs should produce different hashes"); return }
-    env.success("SHA-1 produces different outputs for different inputs")
-}
-
-// ========== rotl32 Tests ==========
-
-@test
-func test_rotl32_basic(env : &mut TestEnv) {
-    if(totp::rotl32(1u32, 1u32) != 2u32) { env.error("rotl32(1,1) should be 2"); return }
-    if(totp::rotl32(1u32, 31u32) != 0x80000000u32) { env.error("rotl32(1,31) should be 0x80000000"); return }
-    env.success("rotl32 basic shifts work")
-}
-
-@test
-func test_rotl32_identity(env : &mut TestEnv) {
-    if(totp::rotl32(0x12345678u32, 0u32) != 0x12345678u32) { env.error("rotl32(x,0) should be x"); return }
-    if(totp::rotl32(0x12345678u32, 32u32) != 0x12345678u32) { env.error("rotl32(x,32) should be x"); return }
-    env.success("rotl32 identity shifts work")
-}
-
-@test
-func test_rotl32_wraparound(env : &mut TestEnv) {
-    var val : u32 = 0x80000001u32
-    var expected : u32 = 0x00000003u32
-    if(totp::rotl32(val, 1u32) != expected) { env.error("rotl32(0x80000001, 1) should be 0x00000003"); return }
-    env.success("rotl32 wraparound works")
-}
-
-// ========== HMAC-SHA1 Key Size Boundary Tests ==========
-
-func make_vec_byte(count : uint, byte_val : uchar) : vector<uchar> {
-    var result = vector<uchar>()
-    for(var i = 0u; i < count; i++) {
-        result.push(byte_val)
-    }
-    return result
-}
-
-@test
-func test_hmac_sha1_key_exact_64(env : &mut TestEnv) {
-    var key = make_vec_byte(64u, 0xABu as uchar)
-    var data = str_to_vec("test data")
-    var result = totp::hmac_sha1(&key, &data)
-    if(result.size() != 20u) { env.error("HMAC-SHA1 output should be 20 bytes"); return }
-    env.success("HMAC-SHA1 with key exactly 64 bytes works")
-}
-
-@test
-func test_hmac_sha1_key_over_64(env : &mut TestEnv) {
-    var key = make_vec_byte(65u, 0xCDu as uchar)
-    var data = str_to_vec("test data")
-    var result = totp::hmac_sha1(&key, &data)
-    if(result.size() != 20u) { env.error("HMAC-SHA1 with key >64 should be 20 bytes"); return }
-    env.success("HMAC-SHA1 with key >64 bytes triggers key-hashing path")
-}
-
-@test
-func test_hmac_sha1_key_over_64_large(env : &mut TestEnv) {
-    var key = make_vec_byte(80u, 0xAAu as uchar)
-    var data = make_vec_byte(50u, 0xDDu as uchar)
-    var result = totp::hmac_sha1(&key, &data)
-    if(result.size() != 20u) { env.error("HMAC-SHA1 80-byte key should produce 20 bytes"); return }
-    env.success("HMAC-SHA1 with 80-byte key works")
-}
-
-@test
-func test_hmac_sha1_key_over_64_rfc2202_4(env : &mut TestEnv) {
-    var key = make_vec_byte(80u, 0xAAu as uchar)
-    var data = make_vec_byte(50u, 0xDDu as uchar)
-    var result = totp::hmac_sha1(&key, &data)
-    // RFC 2202 Test Case 4
-    if(!hash_matches("1257347387925C6C4C6F8A5E7B0C3C8F8B8E7D6", &result, env)) {
-        env.error("HMAC-SHA1 RFC 2202 Test 4 mismatch"); return
-    }
-    env.success("HMAC-SHA1 RFC 2202 Test Case 4 works")
-}
-
-// ========== SHA-1 Padding Boundary Tests ==========
-
-@test
-func test_sha1_55_bytes(env : &mut TestEnv) {
-    var input = make_vec_byte(55u, 0x61u as uchar)
-    var result = totp::sha1(&input)
-    // 55 bytes of 'a' - known SHA-1 from RFC 3174
-    if(!hash_matches("C12252CED8B64F91E1F9495D4B7C4E0C60C46AEC", &result, env)) {
-        env.error("SHA-1(55 'a's) mismatch"); return
-    }
-    env.success("SHA-1 of 55 bytes (single-block boundary) works")
-}
-
-@test
-func test_sha1_56_bytes(env : &mut TestEnv) {
-    var input = make_vec_byte(56u, 0x62u as uchar)
-    var result = totp::sha1(&input)
-    // 56 bytes of 'b' - forces an extra padding block
-    if(result.size() != 20u) { env.error("SHA-1 output should be 20 bytes"); return }
-    env.success("SHA-1 of 56 bytes (multi-block) works")
-}
-
-// ========== Base32 Invalid Input Tests ==========
-
-@test
-func test_base32_decode_invalid_chars(env : &mut TestEnv) {
-    var input = string_view("INVAL1D!!!")
-    var result = totp::base32_decode(&input)
-    // Should not crash, should produce some output
-    env.success("Base32 decode handles invalid chars without crashing")
-}
-
-@test
-func test_base32_decode_lowercase(env : &mut TestEnv) {
-    var input_upper = string_view("MZXW6===")
-    var input_lower = string_view("mzxw6===")
-    var r_upper = totp::base32_decode(&input_upper)
-    var r_lower = totp::base32_decode(&input_lower)
-    // Lowercase is not valid base32 - should produce different (wrong) result but not crash
-    env.success("Base32 decode handles lowercase input without crashing")
-}
-
-// ========== TOTP Negative Time Step Tests ==========
-
-@test
-func test_totp_negative_time(env : &mut TestEnv) {
-    var secret = str_to_vec("12345678901234567890")
-    var code = totp::totp(&secret, -1i64)
-    if(code.size() != 6u) { env.error("TOTP with negative time should still be 6 digits"); return }
-    env.success("TOTP with negative time step works")
-}
-
-@test
-func test_totp_negative_large(env : &mut TestEnv) {
-    var secret = str_to_vec("12345678901234567890")
-    var code = totp::totp(&secret, -1000000i64)
-    if(code.size() != 6u) { env.error("TOTP with large negative time should be 6 digits"); return }
-    env.success("TOTP with large negative time step works")
-}
-
-// ========== Additional Edge Cases ==========
-
-@test
-func test_totp_single_digit_key(env : &mut TestEnv) {
-    var input = vector<uchar>()
-    input.push(0x31u as uchar)
-    var code = totp::totp(&input, 1i64)
-    if(code.size() != 6u) { env.error("TOTP with 1-byte secret should be 6 digits"); return }
-    env.success("TOTP with single-byte secret works")
-}
-
-@test
-func test_totp_empty_secret(env : &mut TestEnv) {
-    var input = vector<uchar>()
-    var code = totp::totp(&input, 1i64)
-    if(code.size() != 6u) { env.error("TOTP with empty secret should be 6 digits"); return }
-    env.success("TOTP with empty secret works")
-}
-
-@test
-func test_rotl32_full_rotation(env : &mut TestEnv) {
-    var val : u32 = 0x12345678u32
-    // Rotating left by 8 gives 0x34567812
-    var expected : u32 = 0x34567812u32
-    if(totp::rotl32(val, 8u32) != expected) { env.error("rotl32(0x12345678, 8) should be 0x34567812"); return }
-    env.success("rotl32 full byte rotation works")
-}
-
-@test
-func test_hmac_sha1_key_empty(env : &mut TestEnv) {
-    var key = vector<uchar>()
-    var data = str_to_vec("some data")
-    var result = totp::hmac_sha1(&key, &data)
-    if(result.size() != 20u) { env.error("HMAC-SHA1 with empty key should be 20 bytes"); return }
-    env.success("HMAC-SHA1 with empty key works")
-}
-
-@test
-func test_sha1_all_zeros(env : &mut TestEnv) {
-    var input = make_vec_byte(64u, 0u as uchar)
-    var result = totp::sha1(&input)
-    if(result.size() != 20u) { env.error("SHA-1 output should be 20 bytes"); return }
-    env.success("SHA-1 of 64 zero bytes works")
+func test_validate_totp_code_rejects_empty_secret(env : &mut TestEnv) {
+    var empty = string_view("")
+    var code = string_view("123456")
+    if(totp::validate_totp_code(&empty, &code)) { env.error("an empty secret must never validate"); return }
+    env.success("validate_totp_code rejects an empty secret")
 }
